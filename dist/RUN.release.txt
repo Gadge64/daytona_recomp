@@ -29,9 +29,12 @@ TO PLAY
   Once assets\ is populated, double-click daytona.exe. It auto-loads the
   .\assets folder next to it - nothing to configure first.
 
-  Or double-click launcher.bat (Windows) for a small settings window first:
-  render resolution, window size, monitor, fullscreen and vsync. Play saves
-  them to daytona.ini and starts the game.
+  Or start the launcher for a small settings window first: render
+  resolution, window size, fullscreen and vsync (and monitor on Windows).
+  Play saves them to daytona.ini and starts the game.
+    Windows:              double-click launcher.bat
+    Steam Deck / Linux:   ./launcher.sh (needs zenity, which SteamOS has;
+                          without it, it just starts the game)
 
   The FIRST launch after a reboot is the slow one: expect up to a minute
   before the SEGA logo while the game's files are read for the first time.
