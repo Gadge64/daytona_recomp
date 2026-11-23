@@ -27,7 +27,11 @@ ADD YOUR GAME
 
 TO PLAY
   Once assets\ is populated, double-click daytona.exe. It auto-loads the
-  .\assets folder next to it - no launcher and nothing to configure first.
+  .\assets folder next to it - nothing to configure first.
+
+  Or double-click launcher.bat (Windows) for a small settings window first:
+  render resolution, window size, monitor, fullscreen and vsync. Play saves
+  them to daytona.ini and starts the game.
 
   The FIRST launch after a reboot is the slow one: expect up to a minute
   before the SEGA logo while the game's files are read for the first time.
@@ -74,7 +78,12 @@ SETTINGS AND LOGS
   Or edit daytona.ini next to the executable by hand, then restart - the file
   is read at startup, not live. It covers window size, fullscreen, monitor,
   vsync, letterbox and safe area under [Display]; filtering and upscaler under
-  [Graphics]; and log level under [Diagnostics]. Leave game_resolution at
+  [Graphics]; and log level under [Diagnostics]. Render resolution is
+  [Graphics] internal_resolution_scale, a multiple of 1280x720: 1.5 = 1080p,
+  2 = 1440p, 3 = 4K. Above your screen's resolution it still sharpens edges.
+  Window sizes in daytona.ini are in Windows' scaled units (at 150% display
+  scaling, 1280x720 is a 1920x1080 window); a window too large for the
+  screen is shrunk to fit. Leave game_resolution at
   1280x720 for authentic output - it is the guest render resolution, not the
   window size. The game runs at a fixed 60 Hz internally; refresh_rate is
   ignored on purpose, because honouring it would change GAME SPEED rather

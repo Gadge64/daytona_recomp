@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -2234,8 +2235,39 @@ bool ReadTexture(const DecodedTexture& t, const uint8_t* base, TextureUpload& ou
 // a headless run (DT_PLUME_WINDOW=0) still has to be able to say what
 // happened, and a window nobody is looking at proves nothing on its own.
 
-constexpr uint32_t kFrameW = 1280;
-constexpr uint32_t kFrameH = 720;
+// The console's frame. Everything the guest draws is laid out against it --
+// the vertex shaders map to clip space and the viewport is always the whole
+// target -- so the target itself can be any multiple of it and the picture
+// simply has more pixels in it. g_frame_w/h are the size actually rendered:
+// this times the ini's internal_resolution_scale, fixed before the first frame
+// creates the targets (see SetRenderScale).
+constexpr uint32_t kBaseFrameW = 1280;
+constexpr uint32_t kBaseFrameH = 720;
+uint32_t g_frame_w = kBaseFrameW;
+uint32_t g_frame_h = kBaseFrameH;
+// Set once EnsureOffscreen has created targets at g_frame_w/h; from then on the
+// size cannot change, because the mirror views, the framebuffer and the
+// readback were all built against it.
+bool g_frame_size_fixed = false;
+
+// daytona.ini's [Display] vsync. Off tore the picture: the guest's 60Hz is its
+// own clock (the plugin's vblank thread), not the display's, so without a
+// synchronised present a frame lands wherever the scanout happens to be.
+bool g_vsync = true;
+
+void SetVsync(bool enabled) { g_vsync = enabled; }
+
+void SetRenderScale(double scale) {
+    if (g_frame_size_fixed) return;
+    // Snapped to steps of 1/20: 1280/20 = 64 and 720/20 = 36, so every step is
+    // an exact 16:9 size whose width is a multiple of 64 -- and 64 texels of
+    // B8G8R8A8 is the 256-byte row pitch the readback copy needs unpadded.
+    // 1.5 is 1920x1080, 2 is 2560x1440, 3 is 3840x2160.
+    const double clamped = std::clamp(scale, 1.0, 4.0);
+    const uint32_t steps = uint32_t(clamped * 20.0 + 0.5);
+    g_frame_w = 64u * steps;
+    g_frame_h = 36u * steps;
+}
 // A safety ceiling, not a sampling limit: the census peak is ~885 draws/frame,
 // so this only ever trips if something loops.
 constexpr uint32_t kMaxDrawsPerFrame = 8192;
@@ -2948,7 +2980,7 @@ uint32_t EnsureMirrorSlot(uint64_t key, const DecodedTexture& t) {
     g_mirror_slots[key] = slot;
     REXLOG_WARN("plume: resolve destination {:08X} {}x{} swizzle {} -> mirror heap slot {} "
                 "({}x{} frame target, sampled instead of re-uploaded)",
-                t.base_address, t.width, t.height, SwizzleName(t.swizzle), slot, kFrameW, kFrameH);
+                t.base_address, t.width, t.height, SwizzleName(t.swizzle), slot, g_frame_w, g_frame_h);
     return slot;
 }
 
@@ -3273,7 +3305,7 @@ bool EnsureWindow() {
     // Fixed size: the frame is copied 1:1 into the backbuffer, and the
     // swapchain takes its size from the client rect, so the two must agree.
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT r = {0, 0, LONG(kFrameW), LONG(kFrameH)};
+    RECT r = {0, 0, LONG(kBaseFrameW), LONG(kBaseFrameH)};
     AdjustWindowRect(&r, style, FALSE);
     g_window = CreateWindowExW(0, wc.lpszClassName, L"Daytona USA -- plume native renderer",
                                style, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -3894,10 +3926,11 @@ bool TrySwapchain(const char* reason) {
     // because presenting was a 1:1 copy -- which is why the renderer made its
     // own window at exactly 1280x720, why the ini's `resolution` never did
     // anything, and why going fullscreen froze the picture. The blit scales.
-    g_swapchain->setVsyncEnabled(false);
+    g_swapchain->setVsyncEnabled(g_vsync);
     RebuildSwapchainTargets();
-    REXLOG_WARN("plume: swapchain ready ({}) -- {}x{} for a {}x{} frame, 2 buffers, vsync off",
-                reason, g_swapchain->getWidth(), g_swapchain->getHeight(), kFrameW, kFrameH);
+    REXLOG_WARN("plume: swapchain ready ({}) -- {}x{} for a {}x{} frame, 2 buffers, vsync {}",
+                reason, g_swapchain->getWidth(), g_swapchain->getHeight(), g_frame_w, g_frame_h,
+                g_vsync ? "on" : "off");
     return true;
 }
 
@@ -3954,7 +3987,7 @@ bool EnsureSwapchainSized() {
     g_swapchain->resize();
     RebuildSwapchainTargets();
     REXLOG_WARN("plume: swapchain resized to {}x{} (frame is {}x{})",
-                g_swapchain->getWidth(), g_swapchain->getHeight(), kFrameW, kFrameH);
+                g_swapchain->getWidth(), g_swapchain->getHeight(), g_frame_w, g_frame_h);
 #ifdef __APPLE__
     // The acquire that follows this call must see the fresh extent on the
     // layer, not whatever a layout event left there.
@@ -3987,9 +4020,9 @@ bool RecordPresentBlit(plume::RenderCommandList* cmd, plume::RenderTexture* back
     // where the viewport is not, and the arithmetic stays somewhere readable.
     const float dst_w = float(g_swapchain->getWidth());
     const float dst_h = float(g_swapchain->getHeight());
-    const float scale = std::min(dst_w / float(kFrameW), dst_h / float(kFrameH));
-    const float w = float(kFrameW) * scale;
-    const float h = float(kFrameH) * scale;
+    const float scale = std::min(dst_w / float(g_frame_w), dst_h / float(g_frame_h));
+    const float w = float(g_frame_w) * scale;
+    const float h = float(g_frame_h) * scale;
     const float x = (dst_w - w) * 0.5f;
     const float y = (dst_h - h) * 0.5f;
 
@@ -4075,12 +4108,13 @@ bool EnsureOffscreen() {
         return false;
     }
 
+    g_frame_size_fixed = true;
     g_color_target = g_device->createTexture(
-        plume::RenderTextureDesc::ColorTarget(kFrameW, kFrameH, kRenderTargetFormat));
+        plume::RenderTextureDesc::ColorTarget(g_frame_w, g_frame_h, kRenderTargetFormat));
     // The pixel shaders write SV_Depth, so the pipelines were compiled against a
     // depth target; the framebuffer must supply one or the draw is invalid.
     g_depth_target = g_device->createTexture(
-        plume::RenderTextureDesc::DepthTarget(kFrameW, kFrameH, kDepthTargetFormat));
+        plume::RenderTextureDesc::DepthTarget(g_frame_w, g_frame_h, kDepthTargetFormat));
     if (g_color_target == nullptr || g_depth_target == nullptr) {
         REXLOG_WARN("plume: offscreen targets failed -- color={} depth={}",
                     g_color_target != nullptr, g_depth_target != nullptr);
@@ -4093,7 +4127,7 @@ bool EnsureOffscreen() {
     // still correct, only slower.
     if (g_gpuloop) {
         g_resolve_mirror = g_device->createTexture(
-            plume::RenderTextureDesc::Texture2D(kFrameW, kFrameH, 1, kRenderTargetFormat));
+            plume::RenderTextureDesc::Texture2D(g_frame_w, g_frame_h, 1, kRenderTargetFormat));
         if (g_resolve_mirror == nullptr) {
             REXLOG_WARN("plume: resolve mirror failed -- resolve destinations will re-upload");
         }
@@ -4109,10 +4143,11 @@ bool EnsureOffscreen() {
 
     // 1280 * 4 = 5120 bytes/row, already a multiple of the 256 bytes D3D12
     // requires of a texture->buffer copy footprint. A width that is not would
-    // need a padded pitch here and an unpadding read below.
-    static_assert((kFrameW * 4) % 256 == 0, "frame width needs a padded readback pitch");
+    // need a padded pitch here and an unpadding read below -- which is why
+    // SetRenderScale only ever produces widths that are multiples of 64.
+    assert((g_frame_w * 4) % 256 == 0 && "frame width needs a padded readback pitch");
     g_readback = g_device->createBuffer(
-        plume::RenderBufferDesc::ReadbackBuffer(uint64_t(kFrameW) * kFrameH * 4));
+        plume::RenderBufferDesc::ReadbackBuffer(uint64_t(g_frame_w) * g_frame_h * 4));
     if (g_readback == nullptr) {
         REXLOG_WARN("plume: readback buffer failed");
         return false;
@@ -4212,7 +4247,7 @@ bool EnsureOffscreen() {
 
     g_offscreen = OffscreenState::kReady;
     REXLOG_WARN("plume: frame target ready -- {}x{} format {} + depth, readback, {}",
-                kFrameW, kFrameH, static_cast<uint32_t>(kRenderTargetFormat),
+                g_frame_w, g_frame_h, static_cast<uint32_t>(kRenderTargetFormat),
                 g_swapchain != nullptr ? "presenting to a window" : "headless");
     return true;
 }
@@ -4774,8 +4809,8 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
         return;
     }
 
-    const plume::RenderViewport viewport(0.0f, 0.0f, float(kFrameW), float(kFrameH));
-    const plume::RenderRect scissor(0, 0, int32_t(kFrameW), int32_t(kFrameH));
+    const plume::RenderViewport viewport(0.0f, 0.0f, float(g_frame_w), float(g_frame_h));
+    const plume::RenderRect scissor(0, 0, int32_t(g_frame_w), int32_t(g_frame_h));
 
     // From here it is pure recording into the frame's already-open list. No
     // clear: the frame was cleared once in BeginFrame, and clearing per draw is
@@ -4915,7 +4950,7 @@ void EndFrame(bool present) {
     // any ImGui frame state, and the dialog list cannot be non-empty before
     // the first warm because open/close only happens in the pre-draw hook.
     if (g_imgui_drawer != nullptr && !g_imgui_font_warmed && BuildImGuiPass()) {
-        rex::ui::AppUIDrawContext warm(kFrameW, kFrameH);
+        rex::ui::AppUIDrawContext warm(g_frame_w, g_frame_h);
         g_imgui_drawer->Draw(warm);
     }
     ++g_frame_index;
@@ -5024,7 +5059,7 @@ void EndFrame(bool present) {
     if (report) {
         g_cmd->copyTextureRegion(
             plume::RenderTextureCopyLocation::PlacedFootprint(g_readback.get(), kRenderTargetFormat,
-                                                              kFrameW, kFrameH, 1, kFrameW),
+                                                              g_frame_w, g_frame_h, 1, g_frame_w),
             plume::RenderTextureCopyLocation::Subresource(g_color_target.get()));
     }
     g_cmd->end();
@@ -5126,7 +5161,7 @@ void EndFrame(bool present) {
     // The resolve path wants this frame's pixels CPU-side, to hand back to the
     // guest. Grabbed here because the readback is already mapped.
     if (g_capture_resolve && g_guest_writeback) {
-        g_resolve_pixels.assign(pixels, pixels + size_t(kFrameW) * kFrameH * 4);
+        g_resolve_pixels.assign(pixels, pixels + size_t(g_frame_w) * g_frame_h * 4);
     }
 
     // DT_PLUME_DUMP=<frame> writes that reported frame out as a BMP. A pixel
@@ -5147,7 +5182,7 @@ void EndFrame(bool present) {
         }
         if (path != nullptr) {
             if (FILE* f = std::fopen(path, "wb")) {
-                const uint32_t image = kFrameW * kFrameH * 4;
+                const uint32_t image = g_frame_w * g_frame_h * 4;
                 const uint32_t offset = 14 + 40;
                 uint8_t header[54] = {};
                 header[0] = 'B'; header[1] = 'M';
@@ -5158,8 +5193,8 @@ void EndFrame(bool present) {
                 put32(2, offset + image);
                 put32(10, offset);
                 put32(14, 40);
-                put32(18, kFrameW);
-                put32(22, uint32_t(-int32_t(kFrameH)));   // negative = top-down
+                put32(18, g_frame_w);
+                put32(22, uint32_t(-int32_t(g_frame_h)));   // negative = top-down
                 header[26] = 1; header[28] = 32;          // 1 plane, 32 bpp
                 put32(34, image);
                 std::fwrite(header, 1, sizeof(header), f);
@@ -5188,7 +5223,7 @@ void EndFrame(bool present) {
     // this is an equality test and not a float-rounding guess. The stored order
     // is B, G, R, A -- kRenderTargetFormat is B8G8R8A8_UNORM.
     uint32_t touched = 0, coloured = 0, sample = 0;
-    for (uint32_t i = 0; i < kFrameW * kFrameH; ++i) {
+    for (uint32_t i = 0; i < g_frame_w * g_frame_h; ++i) {
         const uint8_t b = pixels[i * 4 + 0], g = pixels[i * 4 + 1], r = pixels[i * 4 + 2];
         if (b == kClearB8 && g == kClearG8 && r == kClearR8) continue;
         ++touched;
@@ -5205,7 +5240,7 @@ void EndFrame(bool present) {
                 "pipeline so far), {} buffers; "
                 "{} of {} pixels touched, {} with colour, first {:08X}{}",
                 g_frame_index, g_frame_draws, g_frame_skipped, g_draws_nopipe, buffers,
-                touched, kFrameW * kFrameH, coloured, sample,
+                touched, g_frame_w * g_frame_h, coloured, sample,
                 // What THIS EndFrame did, not what the swapchain is capable of.
                 // Half of them close a frame mid-guest-frame and do not present,
                 // and a label that said "presented" on those would be the kind
@@ -6260,7 +6295,7 @@ void OnResolve(uint32_t dest_texture_ea, const uint8_t* base) {
         map.needed = needed;
         map.tiled = t.tiled;
         map.sx.resize(t.width);
-        for (uint32_t x = 0; x < t.width; ++x) map.sx[x] = x * kFrameW / t.width;
+        for (uint32_t x = 0; x < t.width; ++x) map.sx[x] = x * g_frame_w / t.width;
         map.off.assign(size_t(t.width) * t.height, UINT32_MAX);
         for (uint32_t y = 0; y < t.height; ++y) {
             uint32_t* orow = map.off.data() + size_t(y) * t.width;
@@ -6314,8 +6349,8 @@ void OnResolve(uint32_t dest_texture_ea, const uint8_t* base) {
         const bool full = full_permutation;
         const uint32_t w = width, h = height;
         for (uint32_t y = y0; y < y1; ++y) {
-            const uint32_t sy = y * kFrameH / h;
-            const uint8_t* srow = px + size_t(sy) * kFrameW * 4;
+            const uint32_t sy = y * g_frame_h / h;
+            const uint8_t* srow = px + size_t(sy) * g_frame_w * 4;
             const uint32_t* orow = off_base + size_t(y) * w;
             for (uint32_t x = 0; x < w; ++x) {
                 const uint32_t off = orow[x];
@@ -6704,6 +6739,45 @@ void SetHostWindow(void* native_handle) {
     g_window = static_cast<HWND>(native_handle);
     g_window_borrowed = true;
     g_window_tried = true;   // stop EnsureWindow from creating a second one
+
+    // ...except when it does not fit on its monitor. daytona.ini's `resolution`
+    // is in LOGICAL pixels and the SDK multiplies it by the display scale, so
+    // the default 1920x1080 on a 1080p panel at 150% opens a 2880x1620 window:
+    // the picture hangs off the screen and what is left looks zoomed in (user
+    // screenshot -- the top-left two thirds of the title screen). That is why
+    // 1280x720 looked like the only size that worked there: times 1.5 it is
+    // exactly the panel. Shrink to the work area, keep the shape, recentre; the
+    // swapchain picks the new size up through needsResize and the blit scales.
+    // Not for a maximised or fullscreen (borderless, monitor-sized) window.
+    if (!IsZoomed(g_window)) {
+        MONITORINFO mi = {};
+        mi.cbSize = sizeof(mi);
+        RECT outer = {}, client = {};
+        if (GetMonitorInfoW(MonitorFromWindow(g_window, MONITOR_DEFAULTTONEAREST), &mi) &&
+            GetWindowRect(g_window, &outer) && GetClientRect(g_window, &client)) {
+            const RECT& work = mi.rcWork;
+            const LONG work_w = work.right - work.left, work_h = work.bottom - work.top;
+            const LONG outer_w = outer.right - outer.left, outer_h = outer.bottom - outer.top;
+            const LONG cw = client.right, ch = client.bottom;
+            const LONG frame_w = outer_w - cw, frame_h = outer_h - ch;
+            const LONG mon_w = mi.rcMonitor.right - mi.rcMonitor.left;
+            const LONG mon_h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+            const bool fills_monitor = cw == mon_w && ch == mon_h;   // borderless fullscreen
+            if (!fills_monitor && cw > 0 && ch > 0 && (outer_w > work_w || outer_h > work_h)) {
+                const double fit = std::min(double(work_w - frame_w) / cw,
+                                            double(work_h - frame_h) / ch);
+                const LONG new_cw = LONG(cw * fit), new_ch = LONG(ch * fit);
+                const LONG new_w = new_cw + frame_w, new_h = new_ch + frame_h;
+                SetWindowPos(g_window, nullptr, work.left + (work_w - new_w) / 2,
+                             work.top + (work_h - new_h) / 2, new_w, new_h,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+                REXLOG_WARN("plume: window {}x{} does not fit the monitor's {}x{} work area -- "
+                            "shrunk to {}x{} (daytona.ini's resolution is in logical pixels, "
+                            "scaled by the display scale)",
+                            cw, ch, work_w, work_h, new_cw, new_ch);
+            }
+        }
+    }
 
     // Its size is left alone: the present blit scales the frame to whatever the
     // window is, so daytona.ini's `resolution` finally means something, and the

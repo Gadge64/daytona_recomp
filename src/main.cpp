@@ -184,6 +184,8 @@ void WriteDefaultIni(const std::filesystem::path& path) {
         << "safe_area_y = 100\n"
         << "\n"
         << "[Graphics]\n"
+        << "# Render resolution as a multiple of 1280x720: 1.5 = 1080p, 2 = 1440p,\n"
+        << "# 3 = 4K. Up to 4, in steps of 0.05.\n"
         << "internal_resolution_scale = 1\n"
         << "# off, app, 1, 2, 4, 8, 16\n"
         << "anisotropic_filtering = app\n"
@@ -300,7 +302,10 @@ DaytonaIniSettings LoadDaytonaIni(const std::filesystem::path& exe_dir,
         if (auto value = ParseInt(it->second)) SetCvarInt("monitor", ClampInt(*value, 0, 16));
     }
     if (auto it = values.find("display.vsync"); it != values.end()) {
-        if (auto value = ParseBool(it->second)) SetCvarBool("vsync", *value);
+        if (auto value = ParseBool(it->second)) {
+            SetCvarBool("vsync", *value);
+            dt_plume::SetVsync(*value);
+        }
     }
     // display.refresh_rate is deliberately NOT wired to video_mode_refresh_rate
     // any more. That cvar is the GUEST's video mode -- a console property -- and
@@ -336,9 +341,13 @@ DaytonaIniSettings LoadDaytonaIni(const std::filesystem::path& exe_dir,
         }
     }
 
+    // Fractional for the native renderer (1.5 = 1920x1080); the Xenos
+    // renderer's resolution_scale only takes whole numbers, so it gets the
+    // integer part.
     if (auto it = values.find("graphics.internal_resolution_scale"); it != values.end()) {
-        if (auto value = ParseInt(it->second)) {
-            SetCvarInt("resolution_scale", ClampInt(*value, 1, 8));
+        if (auto value = ParseDouble(it->second)) {
+            dt_plume::SetRenderScale(*value);
+            SetCvarInt("resolution_scale", ClampInt(int32_t(*value), 1, 8));
         }
     }
     if (auto it = values.find("graphics.anisotropic_filtering"); it != values.end()) {

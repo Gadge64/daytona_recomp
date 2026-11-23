@@ -146,6 +146,16 @@ bool PipelinesDirty();
 // after launch. Must win over the env default, hence a call and not a setenv.
 void ForceDisable();
 
+// Render the frame at `scale` times the console's 1280x720 (daytona.ini's
+// [Graphics] internal_resolution_scale): 1.5 = 1080p, 2 = 1440p, 3 = 4K.
+// Clamped to 1..4 and snapped to steps of 0.05. Only takes effect before the
+// first frame; later calls are ignored.
+void SetRenderScale(double scale);
+
+// Present synchronised to the display (daytona.ini's [Display] vsync). Only
+// takes effect before the swapchain is created.
+void SetVsync(bool enabled);
+
 // Create the swapchain if it does not exist yet. Safe and cheap to call every
 // guest Swap; returns immediately once there is one.
 //
